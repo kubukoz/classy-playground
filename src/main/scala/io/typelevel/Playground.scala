@@ -1,55 +1,22 @@
 package io.typelevel
+
 import java.time.LocalDate
 
 import cats.data.{EitherT, Kleisli}
 import cats.effect._
 import cats.implicits._
+import cats.mtl.instances.all._
 import cats.mtl.{ApplicativeAsk, FunctorRaise}
-import cats.mtl.implicits._
-import cats.{FlatMap, Functor, MonadError, Show}
-import io.typelevel.DbError.BadConnection
+import cats.{FlatMap, Show}
 import io.typelevel.Functions.application
-import io.typelevel.NetworkError.InvalidHost
-import monocle.macros.{GenLens, GenPrism}
-import monocle.{Lens, Prism}
 import simulacrum._
 
 import scala.language.{higherKinds, implicitConversions}
+import com.olegpy.meow.hierarchy._
+import io.typelevel.Playground.AppConfig
 
 case class DbConfig(port: Int, url: String)
 case class NetworkConfig(retries: Int, protocol: String)
-
-@typeclass
-trait HasDbConfig[S] {
-  def dbConfig(s: S): DbConfig
-  def port(s: S): Int   = dbConfig(s).port
-  def url(s: S): String = dbConfig(s).url
-}
-
-object HasDbConfig {
-  implicit val dcInstance: HasDbConfig[DbConfig] = x => x
-
-  def composeLens[S, A: HasDbConfig](lens: Lens[S, A]): HasDbConfig[S] = {
-    import ops._
-    lens.get(_).dbConfig
-  }
-}
-
-@typeclass
-trait HasNetworkConfig[S] {
-  def networkConfig(s: S): NetworkConfig
-  def retries(s: S): Int     = networkConfig(s).retries
-  def protocol(s: S): String = networkConfig(s).protocol
-}
-
-object HasNetworkConfig {
-  implicit val ncInstance: HasNetworkConfig[NetworkConfig] = x => x
-
-  def composeLens[S, A: HasNetworkConfig](lens: Lens[S, A]): HasNetworkConfig[S] = {
-    import ops._
-    lens.get(_).networkConfig
-  }
-}
 
 sealed trait DbError extends Product with Serializable
 
@@ -63,49 +30,6 @@ sealed trait NetworkError extends Product with Serializable
 object NetworkError {
   case object InvalidHost  extends NetworkError
   case object NoConnection extends NetworkError
-}
-
-@typeclass
-trait AsDbError[E] {
-  def asDbError(e: E): Option[DbError]
-  def fromDbError(dbError: DbError): E
-}
-
-object AsDbError {
-  implicit val deInstance: AsDbError[DbError] = new AsDbError[DbError] {
-    override def asDbError(e: DbError): Option[DbError] = Some(e)
-    override def fromDbError(e: DbError): DbError       = e
-  }
-
-  def composePrism[E, A: AsDbError](prism: Prism[E, A]): AsDbError[E] = {
-    import ops._
-    new AsDbError[E] {
-      override def asDbError(e: E): Option[DbError] = prism.getOption(e).flatMap(_.asDbError)
-      override def fromDbError(dbError: DbError): E = prism.reverseGet(AsDbError[A].fromDbError(dbError))
-    }
-  }
-}
-
-@typeclass
-trait AsNetworkError[E] {
-  def asNetworkError(e: E): Option[NetworkError]
-  def fromNetworkError(networkError: NetworkError): E
-}
-
-object AsNetworkError {
-  implicit val neInstance: AsNetworkError[NetworkError] = new AsNetworkError[NetworkError] {
-    override def asNetworkError(e: NetworkError): Option[NetworkError]      = Some(e)
-    override def fromNetworkError(networkError: NetworkError): NetworkError = networkError
-  }
-
-  def composePrism[E, A: AsNetworkError](prism: Prism[E, A]): AsNetworkError[E] = {
-    import ops._
-    new AsNetworkError[E] {
-      override def asNetworkError(e: E): Option[NetworkError] = prism.getOption(e).flatMap(_.asNetworkError)
-      override def fromNetworkError(networkError: NetworkError): E =
-        prism.reverseGet(AsNetworkError[A].fromNetworkError(networkError))
-    }
-  }
 }
 
 @typeclass
@@ -135,9 +59,9 @@ trait CanDb[F[_]] extends AnyRef {
 }
 
 object CanDb {
-  implicit def canDbSync[F[_]: Sync: FunctorRaise[?[_], E], E: AsDbError]: CanDb[F] = new CanDb[F] {
-//    override val select: F[Int] = FunctorRaise[F, E].raise(AsDbError[E].fromDbError(DbError.BadConnection))
-    override val select: F[Int] = Sync[F].delay(println("selecting from db...")).as(1000)
+  implicit def canDbSync[F[_]: Sync: FunctorRaise[?[_], DbError]]: CanDb[F] = new CanDb[F] {
+    override val select: F[Int] = FunctorRaise.raise(DbError.BadConnection: DbError)
+//    override val select: F[Int] = Sync[F].delay(println("selecting from db...")).as(1000)
   }
 }
 
@@ -147,76 +71,52 @@ trait CanNetwork[F[_]] {
 }
 
 object CanNetwork {
-  implicit def canNetworkSync[F[_]: Sync: FunctorRaise[?[_], E], E: AsNetworkError]: CanNetwork[F] = new CanNetwork[F] {
-//    override def ping(protocol: String): F[String] = FunctorRaise[F, E].raise(AsNetworkError[E].fromNetworkError(NetworkError.InvalidHost))
+  implicit def canNetworkSync[F[_]: Sync: FunctorRaise[?[_], NetworkError]]: CanNetwork[F] = new CanNetwork[F] {
+//    override def ping(protocol: String): F[String] = FunctorRaise[F, NetworkError].raise(NetworkError.InvalidHost)
     override def ping(protocol: String): F[String] = Sync[F].delay(println(s"pinging using $protocol...")).as("wohoo")
   }
 }
 
-object imps
-    extends AsDbError.ToAsDbErrorOps
-    with AsNetworkError.ToAsNetworkErrorOps
-    with HasDbConfig.ToHasDbConfigOps
-    with HasNetworkConfig.ToHasNetworkConfigOps
-
 object Functions {
-  import imps._
 
-  def makeDbCall[E: AsDbError, R: HasDbConfig, F[_]: ApplicativeAsk[?[_], R]: FlatMap: Logger: CanDb]: F[Int] =
+  def makeDbCall[F[_]: ApplicativeAsk[?[_], DbConfig]: FlatMap: Logger: CanDb]: F[Int] =
     for {
-      config   <- ApplicativeAsk[F, R].ask.map(_.dbConfig)
+      config   <- ApplicativeAsk[F, DbConfig].ask
       _        <- Logger[F].info(s"Read $config from db config")
       response <- CanDb[F].select
     } yield response
 
-  def makeNetworkCall[E: AsNetworkError,
-                      R: HasNetworkConfig,
-                      F[_]: FlatMap: CanNetwork: ApplicativeAsk[?[_], R]: Logger : Console](amount: Int): F[String] =
+  def makeNetworkCall[F[_]: FlatMap: CanNetwork: ApplicativeAsk[?[_], NetworkConfig]: Logger: Console](
+    amount: Int): F[String] =
     for {
-      config   <- ApplicativeAsk[F, R].ask
-      _        <- Logger[F].info(s"Read ${config.networkConfig} from net config (whole config $config)")
+      config   <- ApplicativeAsk[F, NetworkConfig].ask
+      _        <- Logger[F].info(s"Read $config from net config (whole config $config)")
       _        <- Console[F].print("Using amount:")
       _        <- Console[F].print(amount)
       response <- CanNetwork[F].ping(config.protocol)
     } yield response
 
-  def application[E: AsNetworkError: AsDbError,
-                  R: HasNetworkConfig: HasDbConfig,
-                  F[_]: CanDb: CanNetwork: FlatMap: ApplicativeAsk[?[_], R]: Logger : Console]: F[String] =
-    makeDbCall[E, R, F].flatMap(makeNetworkCall[E, R, F])
+  def application[F[_]: CanDb: CanNetwork: FlatMap: ApplicativeAsk[?[_], AppConfig]: Logger: Console]: F[String] =
+    makeDbCall[F].flatMap(makeNetworkCall[F])
 }
 
 object Playground extends IOApp {
   case class AppConfig(dbConfig: DbConfig, networkConfig: NetworkConfig)
-
-  object AppConfig {
-    implicit val hasDbConfig: HasDbConfig[AppConfig] = HasDbConfig.composeLens(GenLens[AppConfig](_.dbConfig))
-    implicit val hasNetworkConfig: HasNetworkConfig[AppConfig] =
-      HasNetworkConfig.composeLens(GenLens[AppConfig](_.networkConfig))
-  }
 
   sealed trait AppError extends Product with Serializable
 
   object AppError {
     case class Db(error: DbError)       extends AppError
     case class Net(error: NetworkError) extends AppError
-
-    implicit val asDbError: AsDbError[AppError] = {
-      val thePrism = GenPrism[AppError, Db].andThen(Prism[Db, DbError](_.error.some)(Db.apply))
-
-      AsDbError.composePrism(thePrism)
-    }
-
-    implicit val asNetworkError: AsNetworkError[AppError] = {
-      val thePrism = GenPrism[AppError, Net].andThen(Prism[Net, NetworkError](_.error.some)(Net.apply))
-
-      AsNetworkError.composePrism(thePrism)
-    }
   }
 
   type App[A] = Kleisli[EitherT[IO, AppError, ?], AppConfig, A]
 
-  val appMain: App[Unit] = application[AppError, AppConfig, App].flatMap(Console[App].putStrLn)
+  //abstraction layer that makes derivation of CanDb, CanNetwork, etc. (using derivation of FunctorRaise[F, DbError]) happen
+  def appF[F[_]: Sync: FlatMap: ApplicativeAsk[?[_], AppConfig]: FunctorRaise[?[_], AppError]: Logger: Console]
+    : F[String] = application[F]
+
+  val appMain: App[Unit] = appF[App].flatMap(Console[App].putStrLn)
 
   val appToIO: App[Unit] => IO[ExitCode] =
     _.run(AppConfig(DbConfig(8080, "localhost"), NetworkConfig(42, "https"))).value.flatMap {
