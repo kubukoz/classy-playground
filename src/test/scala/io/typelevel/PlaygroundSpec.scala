@@ -7,8 +7,8 @@ import org.scalatest.{Assertion, FlatSpec, Matchers}
 import Functions._
 import cats.implicits._
 import cats.mtl.ApplicativeAsk
-import cats.mtl.implicits._
-import imps._
+import cats.mtl.instances.all._
+import com.olegpy.meow.hierarchy._
 
 import scala.language.higherKinds
 
@@ -41,8 +41,8 @@ class PlaygroundSpec extends FlatSpec with Matchers {
         implicit0(logger: Logger[F])   = makeLogger(logs)
         implicit0(console: Console[F]) = makeConsole(prints)
 
-        result1 <- makeNetworkCall[NetworkError, NetworkConfig, F](amount = 100)
-        result2 <- makeNetworkCall[NetworkError, NetworkConfig, F](amount = 20)
+        result1 <- makeNetworkCall[F](amount = 100)
+        result2 <- makeNetworkCall[F](amount = 20)
 
         pingsAfter <- pings.get
         logsAfter  <- logs.get
